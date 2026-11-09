@@ -1,0 +1,364 @@
+name: Buscar trios com cunhas nulas
+on:
+  push:
+    branches: [experiment/trios-cunha-nula]
+    paths: [.github/workflows/trios-cunha-nula.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  busca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        aridade: [2, 3]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Preparar dependencias
+        run: |
+          python -m pip install numpy
+          git clone -q --depth 1 https://github.com/arminbiere/cadical.git ferramentas-cadical
+          (cd ferramentas-cadical && ./configure -q && make -s -j2)
+          cp ferramentas-cadical/build/cadical ./cadical
+          git clone -q --depth 1 https://github.com/marijnheule/drat-trim.git ferramentas-drat
+          gcc -O2 ferramentas-drat/drat-trim.c -o drat-trim
+          mkdir -p trios-artifacts
+          { git -C ferramentas-cadical rev-parse HEAD; git -C ferramentas-drat rev-parse HEAD; ./cadical --version; python -m pip freeze; } > trios-artifacts/toolchain.txt
+      - name: Buscar par ou trio em todas as coordenadas
+        env:
+          ARIDADE: ${{ matrix.aridade }}
+        run: |
+          cat > lift.py <<'PY_LIFT'
+          """Möbius mod 8 on 11 Boolean variables; R has all 232 degree <=3 bits."""
+          import hashlib
+          import itertools
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+          
+          N = 11
+          VARIABLES = [f"y{i}" for i in range(8)] + ["x1", "x2", "x3"]
+          T = {15, 86, 89, 90, 101, 106, 149, 154, 165, 166, 169, 240}
+          R_MASKS = [m for m in range(1 << N) if m.bit_count() <= 3]
+          POSITIVE = {3, 7, 10, 13, 14, 24, 25, 34, 36, 38, 40, 48, 65, 66, 69, 73, 81, 96, 131, 134, 137, 145, 146, 160, 192, 193, 194}
+          NEGATIVE = {5, 7, 12, 13, 20, 21, 22, 25, 26, 34, 35, 36, 38, 44, 52, 67, 69, 70, 80, 81, 82, 152, 164}
+          EXPECTED_SHA256 = "438c50c4e285b883bcb67df8632a6cef568896d964e5b50b423b3d3572eedc77"
+          OUT = Path("trio-mobius-artifacts")
+          
+          
+          def top_from_trio(trio):
+              top = set(T)
+              assert len(trio["phi"]) == 3
+              for i, phi in enumerate(trio["phi"], 8):
+                  for term in phi.split(" + "):
+                      assert re.fullmatch(r"(y[0-7]){3}", term), term
+                      ys = [int(k) for k in re.findall(r"y([0-7])", term)]
+                      assert len(set(ys)) == 3, term
+                      top ^= {(1 << i) | sum(1 << k for k in ys)}
+              return top
+          
+          
+          def coefficients(anf):
+              # Direct truth table, then exact integer Möbius, independent of the CNF.
+              values = [sum(m & point == m for m in anf) % 2 for point in range(1 << N)]
+              for k in range(N):
+                  bit = 1 << k
+                  for s in range(1 << N):
+                      if s & bit:
+                          values[s] -= values[s ^ bit]
+              return values
+          
+          
+          def failures(coeffs, degree, divisor):
+              return [[s, c] for s, c in enumerate(coeffs) if s.bit_count() >= degree and c % divisor]
+          
+          
+          def odd_degree8(top):
+              pairs = {}
+              for a, b in itertools.combinations(sorted(top), 2):
+                  if not a & b:
+                      pairs.setdefault(a | b, []).append([a, b])
+              return {s: ps for s, ps in sorted(pairs.items()) if len(ps) % 2}
+          
+          
+          class Circuit:
+              def __init__(self):
+                  self.nvars = len(R_MASKS)
+                  self.clauses = []
+          
+              def new(self):
+                  self.nvars += 1
+                  return self.nvars
+          
+              @staticmethod
+              def neg(a):
+                  return not a if isinstance(a, bool) else -a
+          
+              def xor(self, a, b):
+                  if isinstance(a, bool):
+                      return self.neg(b) if a else b
+                  if isinstance(b, bool):
+                      return self.neg(a) if b else a
+                  if abs(a) == abs(b):
+                      return a != b
+                  z = self.new()
+                  self.clauses.extend([[-z, a, b], [-z, -a, -b], [z, -a, b], [z, a, -b]])
+                  return z
+          
+              def conj(self, a, b):
+                  if isinstance(a, bool):
+                      return b if a else False
+                  if isinstance(b, bool):
+                      return a if b else False
+                  if abs(a) == abs(b):
+                      return a if a == b else False
+                  z = self.new()
+                  self.clauses.extend([[-z, a], [-z, b], [z, -a, -b]])
+                  return z
+          
+              def force(self, a, value):
+                  if isinstance(a, bool):
+                      if a != value:
+                          self.clauses.append([])
+                  else:
+                      self.clauses.append([a if value else -a])
+          
+              def sub(self, a, b):
+                  result = []
+                  borrow = False
+                  for k, (u, v) in enumerate(zip(a, b)):
+                      p = self.xor(u, v)
+                      result.append(self.xor(p, borrow))
+                      if k < 2:
+                          borrow = self.xor(self.conj(self.neg(u), v), self.conj(self.neg(p), borrow))
+                  return result
+          
+          
+          def encode(top, fixed_r=None, use_degree8=True):
+              c = Circuit()
+              table = [m in top for m in range(1 << N)]
+              for index, m in enumerate(R_MASKS, 1):
+                  table[m] = index
+                  if fixed_r is not None:
+                      c.force(index, m in fixed_r)
+              for k in range(N):
+                  bit = 1 << k
+                  for s in range(1 << N):
+                      if s & bit:
+                          table[s] = c.xor(table[s], table[s ^ bit])
+              mod8 = [[a, False, False] for a in table]
+              for k in range(N):
+                  bit = 1 << k
+                  for s in range(1 << N):
+                      if s & bit:
+                          mod8[s] = c.sub(mod8[s], mod8[s ^ bit])
+              odd = odd_degree8(top) if use_degree8 else {}
+              for s, bits in enumerate(mod8):
+                  # For degree 8, R cannot contribute mod 4. The bit is odd pair parity.
+                  # Only add a unit where independently shown: c_s mod 4 = 2.
+                  if s in odd:
+                      c.force(bits[1], True)
+                  if s.bit_count() >= 6:
+                      c.force(bits[1], False)
+                  if s.bit_count() >= 7:
+                      c.force(bits[2], False)
+              return c
+          PY_LIFT
+          cat > procura.py <<'PY_SEARCH'
+          import itertools as it
+          import json
+          import subprocess as sp
+          import sys
+          from pathlib import Path
+          import numpy as np
+          from lift import Circuit, T, coefficients, failures, encode
+          
+          OUT = Path("trios-artifacts")
+          C = [m for m in range(256) if m.bit_count() == 3]
+          
+          def truth(anf):
+              return np.array([sum(m & y == m for m in anf) % 2 for y in range(256)], dtype=np.uint8)
+          
+          def mobius(v):
+              a = v.copy()
+              for w in (1, 2, 4, 8, 16):
+                  b = a.reshape(-1, 2, w)
+                  b[:, 1, :] ^= b[:, 0, :]
+              return a
+          
+          def echelon(xs):
+              p = {}
+              for x in xs:
+                  while x:
+                      j = x.bit_length()-1
+                      if j not in p:
+                          p[j] = x
+                          break
+                      x ^= p[j]
+              return p
+          
+          def reduce(x, p):
+              for j in sorted(p, reverse=True):
+                  if (x >> j) & 1:
+                      x ^= p[j]
+              return x
+          
+          def geometry():
+              top = truth(T)
+              cubic = [i for i in range(32) if i.bit_count() == 3]
+              quart = [i for i in range(32) if i.bit_count() >= 4]
+              derivatives = np.array([top[np.arange(256) ^ (1 << j)] ^ top for j in range(8)])
+              term = np.array([truth({m}) for m in C])
+              pts_i = np.arange(32)
+              out = []
+              seen = 0
+              for piv in it.combinations(range(8), 5):
+                  free = [(i,j) for i in range(5) for j in range(piv[i]+1,8) if j not in piv]
+                  size = 1 << len(free)
+                  seen += size
+                  for lo in range(0, size, 512):
+                      s = np.arange(lo,min(lo+512,size))
+                      rows = np.tile(np.array([1 << j for j in piv]), (len(s),1))
+                      for k,(i,j) in enumerate(free):
+                          rows[:,i] |= ((s >> k)&1) << j
+                      points = np.zeros((len(s),32), dtype=np.int32)
+                      for i in range(5):
+                          points[:,(pts_i >> i)&1==1] ^= rows[:,i:i+1]
+                      for pt in points[~mobius(top[points])[:,quart].any(1)]:
+                          vec = lambda xs: sum(int(v) << j for j,v in enumerate(xs))
+                          p = echelon(vec(v) for v in mobius(derivatives[:,pt])[:,cubic])
+                          assert len(p) == 3
+                          columns = [reduce(vec(v),p) for v in mobius(term[:,pt])[:,cubic]]
+                          forms = [[i for i,x in enumerate(columns) if x >> j & 1]
+                                   for j in range(10) if j not in p]
+                          out.append((pt,forms,p))
+              assert seen == 97155 and len(out) == 1275
+              return out
+          
+          def wedge(a,b):
+              s=set()
+              for m,n in it.product(a,b):
+                  if not m&n: s ^= {m|n}
+              return s
+          
+          def search(k, data):
+              c = Circuit()
+              c.nvars = k*56
+              v = lambda i,j: i*56+j+1
+              def xor(xs):
+                  r=False
+                  for x in xs:
+                      r=c.xor(r,x)
+                  return r
+              for i in range(k):
+                  for s in range(256):
+                      if s.bit_count() == 7:
+                          c.force(xor(v(i,j) for j,m in enumerate(C) if m&s==m and (s^m) in T),False)
+              for i,j in it.combinations(range(k),2):
+                  for s in range(256):
+                      if s.bit_count() == 6:
+                          c.force(xor(c.conj(v(i,a),v(j,b)) for a,m in enumerate(C)
+                                      for b,n in enumerate(C) if not m&n and m|n==s),False)
+              for _, forms, _ in data:
+                  cols=[[xor(v(i,j) for j in row) for row in forms] for i in range(k)]
+                  for mask in range(1,1<<k):
+                      ls=[xor(cols[i][r] for i in range(k) if mask >> i & 1) for r in range(7)]
+                      if not any(x is True for x in ls):
+                          c.clauses.append([x for x in ls if not isinstance(x,bool)])
+              return c
+          
+          def solve(label,c,secs):
+              f=OUT/(label+".cnf")
+              log=OUT/(label+".log")
+              proof=OUT/(label+".drat")
+              with f.open("w") as out:
+                  out.write(f"p cnf {c.nvars} {len(c.clauses)}\n")
+                  out.writelines(" ".join(map(str,a+[0]))+"\n" for a in c.clauses)
+              print(f"{label}: {c.nvars} variables, {len(c.clauses)} clauses",flush=True)
+              with log.open("w") as out:
+                  rc=sp.run(["./cadical","-t",str(secs),str(f)],stdout=out,stderr=sp.STDOUT,timeout=secs+25).returncode
+              model=None
+              ans={"status":"INDECISO","solver_exit":rc,"limit_s":secs}
+              if rc==10:
+                  ans["status"]="SAT"
+                  model={int(x) for line in log.read_text().splitlines() if line.startswith("v ") for x in line.split()[1:]}
+              elif rc==20:
+                  ans["status"]="UNSAT_SEM_CERTIFICADO"
+                  limit=min(secs,300)
+                  try:
+                      with (OUT/(label+".replay.log")).open("w") as out:
+                          replay=sp.run(["bash","-c",'ulimit -f 262144; exec "$@"',"_","./cadical","-t",str(limit),str(f),str(proof)],
+                                        stdout=out,stderr=sp.STDOUT,timeout=limit+25)
+                      if replay.returncode==20 and proof.exists():
+                          check=sp.run(["./drat-trim",str(f),str(proof),"-t","120"],capture_output=True,text=True,timeout=140)
+                          (OUT/(label+".drat-trim.log")).write_text(check.stdout+check.stderr)
+                          if check.returncode==0 and "s VERIFIED" in check.stdout: ans["status"]="UNSAT_VERIFICADO"
+                  except sp.TimeoutExpired:
+                      pass
+                  if ans["status"]!="UNSAT_VERIFICADO": proof.unlink(missing_ok=True)
+              elif rc != 0:
+                  raise RuntimeError(f"{label}: solver exit {rc}")
+              print(label,ans,flush=True)
+              return ans,model
+          
+          def selected(model,size):
+              assert all(i in model or -i in model for i in range(1,size+1))
+              return [i for i in range(1,size+1) if i in model]
+          
+          def main():
+              k=int(sys.argv[1])
+              OUT.mkdir(exist_ok=True)
+              data=geometry()
+              print("Verified 1,275 U_Y among 97,155 5-spaces",flush=True)
+              cnf=search(k,data)
+              report,m=solve(f"busca-{k}",cnf,900)
+              report.update(arity=k,full_phi_bits=56*k,U_Y=len(data))
+              save=lambda: (OUT/"resumo.json").write_text(json.dumps(report,indent=2)+"\n")
+              save()
+              if m is None: return
+              chosen=selected(m,k*56)
+              phis=[{C[j] for j in range(56) if i*56+j+1 in chosen} for i in range(k)]
+              assert all(not wedge(a,T) for a in phis)
+              assert all(not wedge(a,b) for a,b in it.combinations(phis,2))
+              cub=[i for i in range(32) if i.bit_count()==3]
+              tabs=[truth(p) for p in phis]
+              counts=[]
+              for mask in range(1,1<<k):
+                  f=np.bitwise_xor.reduce([tabs[i] for i in range(k) if mask>>i&1],axis=0)
+                  num=0
+                  for pt,_,basis in data:
+                      q=sum(int(v)<<j for j,v in enumerate(mobius(f[pt])[cub]))
+                      num+=reduce(q,basis)==0
+                  counts.append(num)
+              assert not any(counts)
+              report.update(phi_masks=[sorted(p) for p in phis],isotropic_counts=counts)
+              save()
+              if k==3:
+                  top=T|{(1<<(8+i))|m for i,p in enumerate(phis) for m in p}
+                  lift,m=solve("liftabilidade",encode(top),600)
+                  if m is not None:
+                      low=[m for m in range(2048) if m.bit_count()<=3]
+                      r={low[i-1] for i in selected(m,len(low))}
+                      v=coefficients(top|r)
+                      assert not failures(v,6,4) and not failures(v,7,8)
+                      lift.update(R_masks=sorted(r),D_masks=sorted(top|r),truth_points=2048)
+                  report["liftabilidade"]=lift
+                  save()
+          
+          if __name__=="__main__": main()
+          PY_SEARCH
+          cp lift.py procura.py trios-artifacts/
+          python -u procura.py "$ARIDADE"
+      - name: Guardar placar, CNFs e certificados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cunhas-nulas-${{ matrix.aridade }}
+          path: trios-artifacts/
+          retention-days: 90
